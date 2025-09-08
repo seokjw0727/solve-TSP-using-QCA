@@ -132,18 +132,18 @@ if __name__ == "__main__":
     N_total = 6
 
     # static gate preparations
-    print("--- 정적 게이트 생성 중 (QPE, Diffuser)... ---")
+    print("[¡] Static gate preparations...")
     prep_gate = get_tour_preparation_gate(tour_qubits)
     qpe_gate = get_qpe_gate(anc, qpe_registers)
     iqpe_gate = qpe_gate.inverse(); iqpe_gate.label = "QPE^-1"
     diffuser_gate = get_diffuser_gate(tour_qubits, prep_gate)
-    print("--- 정적 게이트 생성 완료 ---")
+    print("[✓] Static gate preparations complete.")
 
     # generate classical tour map for lookup
     tours = [(0,1,2,3,0),(0,1,3,2,0),(0,2,1,3,0),(0,2,3,1,0),(0,3,1,2,0),(0,3,2,1,0)]
     tour_map = {}
     min_cost_classical = float('inf')
-    print("--- 클래식 경로 정보 ---")
+    print("[¡] Classical tour costs")
     for tour in tours:
         cost = sum(D[tour[k]][tour[k+1]] for k in range(4))
         if cost < min_cost_classical: min_cost_classical = cost
@@ -152,8 +152,8 @@ if __name__ == "__main__":
         b1,b2,b3=bits_from_label(p1),bits_from_label(p2),bits_from_label(p3)
         bitstring = f"{b3[1]}{b3[0]}{b2[1]}{b2[0]}{b1[1]}{b1[0]}"
         tour_map[bitstring] = (tour, cost)
-    print(f" Classically, 최단 경로 비용: {min_cost_classical}")
-    print("------------------------\n")
+    print(f"[✓] Classical minimun cost: {min_cost_classical}")
+    print("===== ===== ===== \n")
 
     # iterative optimization loop
     L_current_best = S
@@ -162,8 +162,8 @@ if __name__ == "__main__":
     backend = Aer.get_backend('qasm_simulator')
     
     for i in range(max_iterations):
-        print(f"===== 최적화 반복 #{i+1} =====")
-        print(f"현재 임계값 L = {L_current_best:.2f}")
+        print(f"Optimization iteration:{i+1}")
+        print(f"Current best L = {L_current_best:.2f}")
 
         oracle_gate = get_flexible_oracle_gate(anc, L_current_best, S, comp_anc)
         
@@ -175,7 +175,7 @@ if __name__ == "__main__":
         grover_circuit.append(diffuser_gate, tour_qubits)
         grover_gate = grover_circuit.to_gate()
 
-        num_counting_qubits = 4
+        num_counting_qubits = 4 # Accuracy of QCA measurement
         qca_anc = QuantumRegister(num_counting_qubits, 'qca_anc')
         c_qca = ClassicalRegister(num_counting_qubits, 'c_qca')
         qca_qc = QuantumCircuit(qca_anc, *problem_registers, c_qca)
@@ -198,15 +198,15 @@ if __name__ == "__main__":
         if phi > 0.5: phi = 1 - phi
         theta = 2 * pi * phi
         M = round(N_total * (sin(theta / 2)**2))
-        print(f"QCA 측정 결과: {measured_binary}, 추정된 위상(phi): {phi:.3f}")
-        print(f"QCA 추정 결과: L보다 짧은 경로의 개수 M ≈ {M}")
+        print(f"QCA measurement: {measured_binary}, measured phase(phi): {phi:.3f}")
+        print(f"QCA estimated result: Number of paths shorter than L (M) ≈ {M}")
 
         if M == 0:
-            print("\n더 이상 짧은 경로가 없습니다. 최적화를 종료합니다.")
+            print("\nNo shorter paths found. Stopping optimization.")
             break
         
         k = floor((pi / 4) * sqrt(N_total / M))
-        print(f"최적 반복 횟수 k = {k}회로 탐색을 수행합니다.")
+        print(f"Optimal number of iterations k = {k}")
         
         c_tour = ClassicalRegister(len(tour_qubits))
         search_qc = QuantumCircuit(*problem_registers, c_tour)
@@ -222,21 +222,21 @@ if __name__ == "__main__":
         counts_search = result_search.get_counts()
         best_bitstring = max(counts_search, key=counts_search.get)
         new_tour, new_cost = tour_map[best_bitstring]
-        print(f"탐색 결과: 경로 {new_tour} (비용: {new_cost})")
+        print(f"Search result: Tour {new_tour} (Cost: {new_cost})")
 
         if new_cost < L_current_best:
             L_current_best = new_cost
             optimal_tour_info = (new_tour, new_cost)
         else:
-            print("측정된 경로가 현재 최적 경로보다 좋지 않으므로 최적화를 종료합니다.")
+            print("Measured path is not better than current best. Stopping optimization.")
             break
         print("----------------------------\n")
 
     # final results
-    print("\n===== 최종 최적화 결과 =====")
+    print("\n Final Optimization Results ")
     if optimal_tour_info:
         tour, cost = optimal_tour_info
-        print(f"찾아낸 최단 경로: {tour}")
-        print(f"최단 경로 비용: {cost}")
+        print(f"Found optimal tour: {tour}")
+        print(f"Optimal tour cost: {cost}")
     else:
-        print("최단 경로를 찾지 못했습니다. (초기 임계값보다 짧은 경로 없음)")
+        print("No optimal tour found. (No paths shorter than initial threshold)")
