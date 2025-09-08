@@ -175,7 +175,7 @@ if __name__ == "__main__":
         grover_circuit.append(diffuser_gate, tour_qubits)
         grover_gate = grover_circuit.to_gate()
 
-        num_counting_qubits = 4 # Accuracy of QCA measurement
+        num_counting_qubits = 4 # Accuracy of QCA measurement (4 -> 6 over)
         qca_anc = QuantumRegister(num_counting_qubits, 'qca_anc')
         c_qca = ClassicalRegister(num_counting_qubits, 'c_qca')
         qca_qc = QuantumCircuit(qca_anc, *problem_registers, c_qca)
@@ -198,15 +198,15 @@ if __name__ == "__main__":
         if phi > 0.5: phi = 1 - phi
         theta = 2 * pi * phi
         M = round(N_total * (sin(theta / 2)**2))
-        print(f"QCA measurement: {measured_binary}, measured phase(phi): {phi:.3f}")
-        print(f"QCA estimated result: Number of paths shorter than L (M) ≈ {M}")
+        print(f"[¡] QCA measurement: {measured_binary}, measured phase(phi): {phi:.3f}")
+        print(f"[¡] QCA estimated result: Number of paths shorter than L (M) ≈ {M}")
 
         if M == 0:
-            print("\nNo shorter paths found. Stopping optimization.")
+            print("\n [✓] No shorter paths found. (Stopping optimization)")
             break
         
         k = floor((pi / 4) * sqrt(N_total / M))
-        print(f"Optimal number of iterations k = {k}")
+        print(f"[✓] Optimal number of iterations k = {k}")
         
         c_tour = ClassicalRegister(len(tour_qubits))
         search_qc = QuantumCircuit(*problem_registers, c_tour)
@@ -222,21 +222,21 @@ if __name__ == "__main__":
         counts_search = result_search.get_counts()
         best_bitstring = max(counts_search, key=counts_search.get)
         new_tour, new_cost = tour_map[best_bitstring]
-        print(f"Search result: Tour {new_tour} (Cost: {new_cost})")
+        print(f"[✓] Search result: Tour {new_tour} (Cost: {new_cost})")
 
         if new_cost < L_current_best:
             L_current_best = new_cost
             optimal_tour_info = (new_tour, new_cost)
         else:
-            print("Measured path is not better than current best. Stopping optimization.")
+            print(" [✓] Measured path is not better than current best. (Stopping optimization)")
             break
         print("----------------------------\n")
 
     # final results
-    print("\n Final Optimization Results ")
+    print("\n [✓] Final Optimization Results ")
     if optimal_tour_info:
         tour, cost = optimal_tour_info
-        print(f"Found optimal tour: {tour}")
-        print(f"Optimal tour cost: {cost}")
+        print(f"[✓] Found optimal tour: {tour}")
+        print(f"[✓] Optimal tour cost: {cost}")
     else:
-        print("No optimal tour found. (No paths shorter than initial threshold)")
+        print("[✓] No optimal tour found. (No paths shorter than initial threshold)")
