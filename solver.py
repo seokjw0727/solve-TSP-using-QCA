@@ -1,348 +1,372 @@
-
-from qiskit import QuantumCircuit, QuantumRegister, ClassicalRegister, transpile
-from qiskit.circuit.library import MCPhaseGate, StatePreparation, QFTGate, IntegerComparator, ZGate
-from qiskit.quantum_info import Operator
-from qiskit_aer import Aer
-from collections import Counter
-from math import tau, ceil, log2, pi, sqrt, floor, sin
+import math
 import random
+import os
 import numpy as np
+import socket
+import time
+from collections import Counter
+from typing import Tuple
 
-# =========================
-# 0) 환경/파라미터
-# =========================
-random.seed(1234)
-N = 4
-SYMMETRIC = True
-D = [[0]*N for _ in range(N)]
-if SYMMETRIC:
-    for i in range(N):
-        for j in range(i+1, N):
-            w = random.randint(5, 20)
-            D[i][j] = w
-            D[j][i] = w
-else:
-    for i in range(N):
-        for j in range(N):
-            if i == j: D[i][j] = 0
-            else: D[i][j] = random.randint(5, 20)
+from pyquil import Program
+from pyquil.gates import H, X, Z, CNOT, CCNOT, CZ, SWAP, CPHASE, MEASURE
+from pyquil.api import get_qc
 
-Cmax_upper = 4 * max(max(row) for row in D)
-S = 1 << ceil(log2(Cmax_upper + 1))
-t = 5
+os.environ.setdefault("QVM_URL",   "http://localhost:5000")
+os.environ.setdefault("QUILC_URL", "http://localhost:5555")
 
-# =========================
-# 2) 유틸 및 게이트 생성 함수
-# =========================
-def print_gate_matrix(gate_name, gate):
-    """게이트의 행렬 표현을 출력하는 함수"""
-    try:
-        matrix = Operator(gate).data
-        print(f"--- Matrix for {gate_name} (size: {matrix.shape}) ---")
-        print(matrix)
-        print("-" * (len(gate_name) + 20))
-    except Exception as e:
-        print(f"Could not get matrix for {gate_name}: {e}")
-
-def controls_for_value(bits, v):
-    binv = [(v >> k) & 1 for k in range(len(bits))]
-    prepared, need_flip = [], []
-    for qb, want1 in zip(bits, binv):
-        if want1 == 1: prepared.append(qb)
-        else: need_flip.append(qb)
-    return prepared, need_flip
-
-def apply_x_on_list(qc, qubits):
-    for q in qubits: qc.x(q)
-
-def bits_from_label(v):
-    assert v in (1,2,3)
-    return (v & 1, (v >> 1) & 1)
-
-def index_from_lsb_bits(bits_lsb):
-    idx = 0
-    for i, b in enumerate(bits_lsb): idx |= (b & 1) << i
-    return idx
-
-def get_general_qpe_gate(unitary_op, counting_anc_reg, state_qregs):
+def _wait_port(host: str, port: int, retries: int = 20, delay: float = 0.5):
     """
-    주어진 유니타리 연산자(unitary_op)에 대한
-    범용 양자 위상 추정(QPE) 게이트를 생성합니다.
+    host:port가 열릴 때까지 재시도하며 대기함. 열리면 True, 실패하면 False를 반환함.
     """
-    num_counting_qubits = len(counting_anc_reg)
-    qpe_qc = QuantumCircuit(counting_anc_reg, *state_qregs, name="General_QPE")
-    state_qubits = [q for reg in state_qregs for q in reg]
-    
-    # 1. 카운팅 큐비트에 H 게이트를 적용
-    qpe_qc.h(counting_anc_reg)
+    for _ in range(retries):
+        try:
+            with socket.create_connection((host, port), timeout=1.5):
+                return True
+        except OSError:
+            time.sleep(delay)
+    return False
 
-    # 2. 제어-U 연산을 반복
-    for k in range(num_counting_qubits):
-        num_repeats = 2**k
-        controlled_op = unitary_op.control(1)
-        
-        for _ in range(num_repeats):
-            control_qubit = counting_anc_reg[k]
-            qpe_qc.append(controlled_op, [control_qubit] + state_qubits)
-
-    # 3. <<-- 여기가 최종 수정 사항 -->>
-    #    QFTGate를 먼저 생성한 후, .inverse() 메서드를 호출하여 IQFT 게이트를 만듭니다.
-    iqft_gate = QFTGate(num_counting_qubits).inverse()
-    iqft_gate.name = "IQFT" # 게이트 이름 설정
-    qpe_qc.append(iqft_gate, counting_anc_reg)
-
-    return qpe_qc.to_gate()
-
-def get_tour_preparation_gate(pos_qubits, unique_sym=False):
-    tours = [(1,2,3),(1,3,2),(2,1,3),(2,3,1),(3,1,2),(3,2,1)]
-    if unique_sym: tours = [(1,2,3),(1,3,2),(2,3,1)]
-    amps = np.zeros(1 << len(pos_qubits), dtype=complex)
-    for (a,b,c) in tours:
-        a_bits,b_bits,c_bits = bits_from_label(a),bits_from_label(b),bits_from_label(c)
-        bits_lsb = [a_bits[0],a_bits[1],b_bits[0],b_bits[1],c_bits[0],c_bits[1]]
-        idx = index_from_lsb_bits(bits_lsb)
-        amps[idx] = 1.0
-    amps = amps / np.sqrt(len(tours))
-    return StatePreparation(amps)
-
-def U_cost_block(qc, pos0, pos1, pos2, pos3, ph, extra_ctrl=None, scale_factor=1):
-    def add_edge(posA, posB):
-        for i in range(N):
-            for j in range(N):
-                if i == j: continue
-                angle = tau * D[i][j] * scale_factor / S
-                ctrlA, undoA = controls_for_value(posA, i)
-                ctrlB, undoB = controls_for_value(posB, j)
-                apply_x_on_list(qc, undoA + undoB)
-                all_controls = ctrlA + ctrlB
-                if extra_ctrl is not None: all_controls.append(extra_ctrl)
-                gate = MCPhaseGate(angle, num_ctrl_qubits=len(all_controls))
-                qc.append(gate, all_controls + [ph[0]])
-                apply_x_on_list(qc, undoA + undoB)
-    add_edge(pos0, pos1); add_edge(pos1, pos2); add_edge(pos2, pos3); add_edge(pos3, pos0)
-
-def get_qpe_gate(anc, qpe_registers):
-    pos0, pos1, pos2, pos3, _, ph = qpe_registers
-    qpe_qc = QuantumCircuit(*qpe_registers, name="QPE_Block")
-    qpe_qc.h(anc)
-    for k, a in enumerate(anc):
-        scale = 2**k
-        U_cost_block(qpe_qc, pos0, pos1, pos2, pos3, ph, extra_ctrl=a, scale_factor=scale)
-    qpe_qc.append(QFTGate(len(anc), inverse=True), anc)
-    return qpe_qc.decompose().to_gate(label="QPE")
-
-def get_flexible_oracle_gate(num_tour_qubits, num_anc_qubits, L):
+def _run_with_retry(qc, exe, tries: int = 3, delay: float = 1.5):
     """
-    임의의 임계값 L을 기준으로 해답을 표식하는 유연한 오라클을 생성합니다.
-    "측정된 비용(anc) < L" 이면 전체 상태의 위상을 바꿉니다.
+    PyQuil 실행을 네트워크/일시적 오류에 대비해 재시도하며 결과를 반환함.
     """
-    # 1. IntegerComparator '회로'를 생성합니다.
-    comparator_circuit = IntegerComparator(
-        num_state_qubits=num_anc_qubits, 
-        value=L, 
-        geq=False
-    )
-    
-    # <<-- 여기가 핵심 수정 사항 1 -->>
-    # 2. 이 회로를 하나의 '게이트'로 변환합니다.
-    comparator_gate = comparator_circuit.to_gate(label="cmp")
+    for i in range(tries):
+        try:
+            return qc.run(exe)
+        except Exception:
+            if i == tries - 1:
+                raise
+            time.sleep(delay)
 
-    num_comp_ancillas = comparator_circuit.num_ancillas
-
-    tour_reg = QuantumRegister(num_tour_qubits, name='tour')
-    anc_reg = QuantumRegister(num_anc_qubits, name='anc')
-    result_qubit = QuantumRegister(1, name="res")
-    comp_anc_reg = QuantumRegister(num_comp_ancillas, name='comp_anc')
-
-    oracle = QuantumCircuit(tour_reg, anc_reg, result_qubit, comp_anc_reg, name=f"Oracle(L<{L})")
-
-    qargs = anc_reg[:] + comp_anc_reg[:] + result_qubit[:]
-    
-    # <<-- 여기가 핵심 수정 사항 2 -->>
-    # 3. 회로가 아닌 '게이트'를 append 합니다.
-    oracle.append(comparator_gate, qargs)
-    oracle.cz(result_qubit[0], tour_reg[0])
-    # 게이트의 역행렬을 append 합니다.
-    oracle.append(comparator_gate.inverse(), qargs)
-
-    # 4. 이제 Oracle 회로는 내부 부품들이 모두 게이트이므로, 자신도 게이트로 변환될 수 있습니다.
-    return oracle.to_gate()
-
-def get_precise_diffuser_gate(state_preparation_gate):
+def gen_symmetric_dist_4(seed=42):
     """
-    주어진 StatePreparation 게이트(A)를 사용하여
-    그 초기 상태 |S⟩를 정확히 반사점으로 삼는 정밀한 Diffuser 게이트를 생성합니다.
+    4개 도시의 대칭 거리행렬을 난수로 생성하여 반환함.
     """
-    num_qubits = state_preparation_gate.num_qubits
-    
-    A_dagger = state_preparation_gate.inverse()
-    A_dagger.name = "A_dg"
+    random.seed(seed)
+    d01 = random.randint(1, 5)
+    d02 = random.randint(1, 5)
+    d03 = random.randint(1, 5)
+    d12 = random.randint(1, 5)
+    d13 = random.randint(1, 5)
+    d23 = random.randint(1, 5)
+    D = [[0, d01, d02, d03],
+         [d01, 0, d12, d13],
+         [d02, d12, 0, d23],
+         [d03, d13, d23, 0]]
+    return D
 
-    # 1. |0...0> 상태에 대한 반사 '회로'를 생성합니다.
-    reflection_circuit = QuantumCircuit(num_qubits, name="Ref_0")
-    reflection_circuit.x(range(num_qubits))
-    reflection_circuit.append(ZGate().control(num_qubits - 1), range(num_qubits))
-    reflection_circuit.x(range(num_qubits))
+TOUR_LIST = [
+    [0,1,2,3,0],
+    [0,1,3,2,0],
+    [0,2,1,3,0],
+    [0,2,3,1,0],
+    [0,3,1,2,0],
+    [0,3,2,1,0],
+]
 
-    # <<-- 여기가 핵심 수정 사항 -->>
-    # 2. 이 반사 회로를 하나의 '게이트'로 변환합니다.
-    reflection_gate = reflection_circuit.to_gate()
-
-    # 3. 이제 모든 부품(A_dagger, reflection_gate, state_preparation_gate)이
-    #    게이트이므로, 이것들을 조립한 diffuser 회로도 게이트로 변환될 수 있습니다.
-    diffuser = QuantumCircuit(num_qubits, name="PreciseDiffuser")
-    diffuser.append(A_dagger, range(num_qubits))
-    diffuser.append(reflection_gate, range(num_qubits))
-    diffuser.append(state_preparation_gate, range(num_qubits))
-    
-    return diffuser.to_gate()
-
-def run_qca_with_majority(backend, qca_qc, *, repeats=5, shots=2048, num_counting_qubits=6, N_total=6):
+def tour_lengths(D):
     """
-    QCA 회로를 여러 번 실행하고, 모든 측정 결과를 누적하여 가장 많이 나온 결과를 선택합니다.
+    미리 정의한 6개의 투어에 대한 총 길이 리스트(길이 6)를 계산해 반환함.
     """
-    tqc = transpile(qca_qc, backend)
-    total_counts = Counter()
+    def length(route):
+        return sum(D[route[i]][route[i+1]] for i in range(len(route)-1))
+    return [length(t) for t in TOUR_LIST]
 
-    # 'repeats' 만큼 실행하여 모든 측정 결과를 'total_counts'에 누적합니다.
-    for _ in range(repeats):
-        result = backend.run(tqc, shots=shots).result()
-        counts = result.get_counts()
-        total_counts.update(counts)
+def pretty_tours(D, lens):
+    """
+    거리행렬과 6개 투어 및 각 길이를 보기 좋게 출력함.
+    """
+    print("=== Quantum TSP (pyQuil, MVP A=H^3) ===")
+    print("Distance matrix:")
+    for r in D:
+        print("  ", r)
+    print("\nTours and lengths:")
+    for i, t in enumerate(TOUR_LIST):
+        print(f"  idx {i}: {t} -> {lens[i]}")
 
-    # 누적된 결과에서 가장 많이 나온 값을 최종 승자로 선택합니다.
-    majority_winner = total_counts.most_common(1)[0][0]
-    
-    # 최종 승자(binary string)를 기반으로 M 값을 추정합니다.
-    measured_int = int(majority_winner, 2)
-    phi = measured_int / (2**num_counting_qubits)
-    if phi > 0.5:
-        phi = 1 - phi
-    theta = 2 * pi * phi
-    # M의 추정치는 sin^2(theta/2)에 비례합니다. 0이 되는 것을 방지하기 위해 max(1, ...) 사용
-    M = max(1, round(N_total * (sin(theta / 2)**2)))
+def qft(program: Program, qubits):
+    """
+    입력 큐빗열에 대해 표준 QFT(스왑 포함)를 적용함. qubits는 MSB→LSB 순서로 가정함.
+    """
+    n = len(qubits)
+    for j in range(n):
+        qj = qubits[j]
+        program += H(qj)
+        for k in range(j+1, n):
+            qk = qubits[k]
+            angle = math.pi / (2 ** (k - j))
+            program += CPHASE(angle, qk, qj)
+    for j in range(n // 2):
+        program += SWAP(qubits[j], qubits[n-1-j])
 
-    # winners_per_run 대신 전체 누적 결과를 반환합니다.
-    return majority_winner, phi, theta, M, total_counts
-# ======================================================================
+def iqft(program: Program, qubits):
+    """
+    qft의 역연산(IQFT)을 적용함. qubits는 MSB→LSB 순서로 가정함.
+    """
+    n = len(qubits)
+    for j in range(n // 2):
+        program += SWAP(qubits[j], qubits[n-1-j])
+    for j in reversed(range(n)):
+        qj = qubits[j]
+        for k in reversed(range(j+1, n)):
+            qk = qubits[k]
+            angle = -math.pi / (2 ** (k - j))
+            program += CPHASE(angle, qk, qj)
+        program += H(qj)
 
-# =========================
-# 3. 메인 실행 블록
-# =========================
+def and_two_controls(prog: Program, c0, c1, tgt):
+    """
+    tgt <- tgt XOR (c0 AND c1)을 수행함. tgt가 0에서 시작하면 tgt=c0&c1이 됨.
+    """
+    prog += CCNOT(c0, c1, tgt)
+
+def and_chain(prog: Program, ctrls, anc_chain):
+    """
+    다수 컨트롤의 AND를 anc_chain을 사용해 누적 계산함. 마지막 anc가 AND(ctrls)를 보유함.
+    """
+    assert len(ctrls) >= 2
+    assert len(anc_chain) >= len(ctrls) - 1
+    and_two_controls(prog, ctrls[0], ctrls[1], anc_chain[0])
+    for i in range(2, len(ctrls)):
+        and_two_controls(prog, anc_chain[i-2], ctrls[i], anc_chain[i-1])
+    return anc_chain[len(ctrls)-2]
+
+def and_chain_uncompute(prog: Program, ctrls, anc_chain):
+    """
+    and_chain으로 만든 AND 누적을 역연산하여 anc들을 깨끗하게 되돌림.
+    """
+    for i in reversed(range(2, len(ctrls))):
+        prog += CCNOT(anc_chain[i-2], ctrls[i], anc_chain[i-1])
+    prog += CCNOT(ctrls[0], ctrls[1], anc_chain[0])
+
+def compute_tour_eq(prog: Program, tour_bits, value, t0, eq_out):
+    """
+    tour_bits가 value(0~5)와 정확히 같을 때 eq_out을 1로 만드는 비교기를 계산함.
+    """
+    flips = []
+    for b in range(3):
+        bit = tour_bits[b]
+        want = (value >> b) & 1
+        if want == 0:
+            prog += X(bit)
+            flips.append(bit)
+    prog += CCNOT(tour_bits[0], tour_bits[1], t0)
+    prog += CCNOT(t0, tour_bits[2], eq_out)
+    prog += CCNOT(tour_bits[0], tour_bits[1], t0)
+    for bit in flips:
+        prog += X(bit)
+
+def uncompute_tour_eq(prog: Program, tour_bits, value, t0, eq_out):
+    """
+    compute_tour_eq로 만든 표식을 역연산하여 eq_out과 보조비트를 모두 원상복구함.
+    """
+    flips = []
+    for b in range(3):
+        bit = tour_bits[b]
+        want = (value >> b) & 1
+        if want == 0:
+            flips.append(bit)
+    for bit in flips:
+        prog += X(bit)
+    prog += CCNOT(tour_bits[0], tour_bits[1], t0)
+    prog += CCNOT(t0, tour_bits[2], eq_out)
+    prog += CCNOT(tour_bits[0], tour_bits[1], t0)
+    for bit in flips:
+        prog += X(bit)
+
+def apply_U_power_controlled(prog: Program, tour_bits, ctrl, ph, selAnc, lengths, p, power=1):
+    """
+    각 투어 상태 |i>에 길이 lengths[i]를 위상으로 부여하는 U^(power)를 ph에 킥백으로 적용함.
+    ctrl이 주어지면 ctrl=1일 때만 적용되도록 제어함.
+    """
+    t0, eq_out = selAnc
+    for i in range(6):
+        compute_tour_eq(prog, tour_bits, i, t0, eq_out)
+        if ctrl is not None:
+            prog += CCNOT(eq_out, ctrl, t0)
+            anc2 = t0
+        else:
+            anc2 = eq_out
+        theta = 2.0 * math.pi * ((power * lengths[i]) / (2 ** p))
+        prog += CPHASE(theta, anc2, ph)
+        if ctrl is not None:
+            prog += CCNOT(eq_out, ctrl, t0)
+        uncompute_tour_eq(prog, tour_bits, i, t0, eq_out)
+
+def set_flag_if_phase_lt_L(prog: Program, phase_bits, flag, cmpAnc, L):
+    """
+    위상레지스터의 정수값이 L보다 작으면 flag를 토글함. (OR_{x<L} [phase==x])
+    """
+    p = len(phase_bits)
+    phase_lsb = list(reversed(phase_bits))
+    for x in range(L):
+        flips = []
+        ctrls = []
+        for b in range(p):
+            bit = phase_lsb[b]
+            want = (x >> b) & 1
+            if want == 1:
+                ctrls.append(bit)
+            else:
+                prog += X(bit)
+                flips.append(bit)
+                ctrls.append(bit)
+        if len(ctrls) == 1:
+            prog += CNOT(ctrls[0], flag)
+        else:
+            last = and_chain(prog, ctrls, cmpAnc)
+            prog += CNOT(last, flag)
+            and_chain_uncompute(prog, ctrls, cmpAnc)
+        for bit in flips:
+            prog += X(bit)
+
+def append_paper_oracle(prog: Program, phase, tour, flag, cmpAnc, ph, selAnc, lengths, p, L, ctrl_qubit=None):
+    """
+    논문식 오라클(O_<L>): QPE → 비교기(<L) → 중심위상(Z/CZ) → 비교기 역연산 → inv-QPE를 구성함.
+    ctrl_qubit이 주어지면 오라클 전체를 그 큐빗으로 제어함.
+    """
+    for qb in phase:
+        prog += H(qb)
+    for j in range(p):
+        power = 2 ** j
+        ctrl = phase[p-1-j]
+        apply_U_power_controlled(prog, tour, ctrl, ph, selAnc, lengths, p, power=power)
+    iqft(prog, phase)
+    set_flag_if_phase_lt_L(prog, phase, flag, cmpAnc, L)
+    if ctrl_qubit is None:
+        prog += Z(flag)
+    else:
+        prog += CZ(ctrl_qubit, flag)
+    set_flag_if_phase_lt_L(prog, phase, flag, cmpAnc, L)
+    qft(prog, phase)
+    for j in reversed(range(p)):
+        power = 2 ** j
+        ctrl = phase[p-1-j]
+        lengths_neg = [-ell for ell in lengths]
+        apply_U_power_controlled(prog, tour, ctrl, ph, selAnc, lengths_neg, p, power=power)
+    for qb in phase:
+        prog += H(qb)
+
+def apply_diffusion_MVP_ctrl(prog: Program, tour, anc, count_ctrl=None):
+    """
+    A=H^3 기반의 경량 확산자 D를 구성해 투어 서브스페이스에서 반사 연산을 수행함.
+    count_ctrl이 주어지면 중앙 반사를 그 큐빗으로 제어함.
+    """
+    for qb in tour:
+        prog += H(qb)
+    for qb in tour:
+        prog += X(qb)
+    t = tour[-1]
+    ctrls = list(tour[:-1])
+    if count_ctrl is not None:
+        ctrls = [count_ctrl] + ctrls
+    prog += H(t)
+    if len(ctrls) == 0:
+        prog += Z(t)
+    elif len(ctrls) == 1:
+        prog += CNOT(ctrls[0], t)
+    elif len(ctrls) == 2:
+        prog += CCNOT(ctrls[0], ctrls[1], t)
+    elif len(ctrls) == 3:
+        prog += CCNOT(ctrls[0], ctrls[1], anc)
+        prog += CCNOT(anc, ctrls[2], t)
+        prog += CCNOT(ctrls[0], ctrls[1], anc)
+    else:
+        raise ValueError("Too many controls for 3-qubit tour in MVP diffusion.")
+    prog += H(t)
+    for qb in tour:
+        prog += X(qb)
+    for qb in tour:
+        prog += H(qb)
+
+def run_qca(lengths, p=5, m=5, seed=7):
+    """
+    논문식 오라클과 경량 확산자를 사용한 양자카운팅 회로를 생성·실행하고 추정치를 반환함.
+    """
+    random.seed(seed)
+    n_count = m
+    n_phase = p
+    n_tour  = 3
+    n_flag  = 1
+    n_cmp   = max(0, p-1)
+    n_sel   = 2
+    n_ph    = 1
+    n_diffA = 1
+    base = 0
+    idx_count = list(range(base, base+n_count)); base += n_count
+    idx_phase = list(range(base, base+n_phase)); base += n_phase
+    idx_tour  = list(range(base, base+n_tour));  base += n_tour
+    idx_flag  = [base]; base += 1
+    idx_cmp   = list(range(base, base+n_cmp));   base += n_cmp
+    idx_sel   = list(range(base, base+n_sel));   base += n_sel
+    idx_ph    = [base]; base += 1
+    idx_dAnc  = [base]; base += 1
+    prog = Program()
+    prog += X(idx_ph[0])
+    for qb in idx_tour:
+        prog += H(qb)
+    for qb in idx_count:
+        prog += H(qb)
+    def append_controlled_G_once(L, ctrl_bit):
+        """
+        제어 비트 하나로 오라클과 확산자를 한 번 적용함.
+        """
+        nonlocal prog
+        append_paper_oracle(prog, idx_phase, idx_tour, idx_flag[0],
+                            idx_cmp, idx_ph[0], idx_sel, lengths, p, L, ctrl_qubit=ctrl_bit)
+        apply_diffusion_MVP_ctrl(prog, idx_tour, idx_dAnc[0], count_ctrl=ctrl_bit)
+    for b in range(m):
+        ctrl = idx_count[b]
+        reps = 2 ** (m - 1 - b)
+        for _ in range(reps):
+            L = max(lengths)
+            append_controlled_G_once(L, ctrl)
+    iqft(prog, idx_count)
+    ro = prog.declare('ro', 'BIT', m)
+    for j, qb in enumerate(idx_count):
+        prog += MEASURE(qb, ro[j])
+    shots = 512  # QCA 샷 수
+    prog.wrap_in_numshots_loop(shots)
+    qc  = get_qc("25q-pyqvm", compiler_timeout=600)
+    exe = qc.compile(prog)
+    res = qc.run(exe)
+    reg = res.get_register_map()
+    prefer = ('count', 'ro')
+    key = next((k for k in prefer if k in reg), next(iter(reg)))
+    arr = np.asarray(reg[key])
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.ndim == 3:
+        arr = np.squeeze(arr)
+    if arr.shape[0] != shots and arr.shape[1] == shots:
+        arr = arr.T
+    if arr.shape[0] != shots and arr.shape[0] == 1 and arr.shape[1] == shots:
+        arr = arr.T
+    arr = arr.astype(int, copy=False)
+    bitstrings = ["".join('1' if b else '0' for b in row) for row in arr]
+    counts = Counter(bitstrings)
+    total = sum(counts.values())
+    print(f"[QCA] shots={shots}  unique={len(counts)}  total={total}")
+    print("[QCA] counts(top5):", counts.most_common(5))
+    argmax_bs, _ = counts.most_common(1)[0]
+    argmax_int = int(argmax_bs, 2)
+    theta = argmax_int / (2 ** m)
+    M_est = round(8 * (math.sin(math.pi * theta) ** 2))
+    return {
+        "counts": dict(counts),
+        "argmax": argmax_bs,
+        "theta": theta,
+        "M_est": M_est,
+        "qasm_qubits": total
+    }
+
 if __name__ == "__main__":
-    
-    # --- 추가된 헬퍼 함수들 (이전과 동일) ---
-    def calculate_cost(D, path):
-        cost = 0;
-        for i in range(len(path) - 1): cost += D[path[i]][path[i+1]]
-        return cost
-    def binary_to_path(binary_str, N):
-        bits = [int(b) for b in reversed(binary_str)]; a = (bits[1] << 1) | bits[0]; b = (bits[3] << 1) | bits[2]; c = (bits[5] << 1) | bits[4]
-        return [0, a, b, c, 0] if N == 4 else None
-    from itertools import permutations
-    def calculate_classical_tsp(D):
-        cities = list(range(1, N)); min_cost = float('inf'); best_path = None
-        for p in permutations(cities):
-            path = [0] + list(p) + [0]; cost = calculate_cost(D, path)
-            if cost < min_cost: min_cost = cost; best_path = path
-        return min_cost, best_path
-    # --- 헬퍼 함수 끝 ---
-
-    # --- 1. 초기 설정 및 큐비트 레지스터 정의 ---
-    num_tour_qubits = (N - 1) * 2
-    N_total = 6 # (N-1)! for N=4
-    num_anc_qubits = t
-    backend = Aer.get_backend('aer_simulator')
-    
-    tour_reg = QuantumRegister(num_tour_qubits, name='tour')
-    anc_reg = QuantumRegister(num_anc_qubits, name='anc')
-    res_qubit = QuantumRegister(1, name="res")
-    temp_comp = IntegerComparator(num_anc_qubits, value=1)
-    comp_anc_reg = QuantumRegister(temp_comp.num_ancillas, name='comp_anc')
-    all_grover_qregs = [tour_reg, anc_reg, res_qubit, comp_anc_reg]
-    
-    print("="*40); print(f"Quantum TSP Solver for {N} cities"); print(f"Distance Matrix D:\n{np.array(D)}"); print(f"Scaling Factor (S): {S}, QPE Precision (t): {t}"); print("="*40)
-
-    # --- 2. 정적(Static) 양자 게이트 생성 ---
-    print("[Log] Creating static quantum gates...")
-    state_prep_gate = get_tour_preparation_gate(tour_reg)
-    diffuser_gate = get_precise_diffuser_gate(state_prep_gate)
-    print("[Log] Static gates created successfully.\n")
-
-    # --- 3. 완전 자동 최적화 루프 ---
-    iteration = 1; current_threshold_L = float(S); best_cost_found = float(S); best_path_found = None
-    
-    print("="*40); print("🚀 Starting Automated Optimization Loop with QCA..."); print("="*40)
-
-    while True:
-        print(f"\n--- Iteration #{iteration} ---"); print(f"Searching for paths with cost < {current_threshold_L}")
-
-        # 3.1) 오라클 및 그로버 연산자 게이트 생성
-        oracle_gate = get_flexible_oracle_gate(
-            num_tour_qubits, num_anc_qubits, int(current_threshold_L)
-        )
-        grover_op = QuantumCircuit(*all_grover_qregs, name="GroverOp")
-        grover_op.append(oracle_gate, grover_op.qubits)
-        grover_op.append(diffuser_gate, tour_reg)
-        grover_op_gate = grover_op.to_gate()
-
-        # 3.2) QCA 실행
-        print("[Log] Running QCA to count solutions...")
-        qca_anc_reg = QuantumRegister(num_anc_qubits, name='qca_anc')
-        
-        # <<-- 여기가 최종 수정 사항 1: QCA용 ClassicalRegister 추가 -->>
-        qca_cr = ClassicalRegister(num_anc_qubits, name='qca_c')
-        qca_qc = QuantumCircuit(qca_anc_reg, *all_grover_qregs, qca_cr)
-        
-        qca_qc.append(state_prep_gate, tour_reg)
-        
-        qca_gate = get_general_qpe_gate(
-            unitary_op=grover_op_gate,
-            counting_anc_reg=qca_anc_reg,
-            state_qregs=all_grover_qregs
-        )
-        qca_qc.append(qca_gate, qca_qc.qubits)
-
-        # <<-- 여기가 최종 수정 사항 2: qca_anc_reg만 정확히 측정 -->>
-        qca_qc.measure(qca_anc_reg, qca_cr)
-        
-        _, _, _, M, _ = run_qca_with_majority(
-            backend, qca_qc, repeats=5, shots=2048,
-            num_counting_qubits=num_anc_qubits, N_total=N_total
-        )
-        print(f"  -> QCA Result: M ≈ {M}")
-
-        if M == 0:
-            print(f"\n[Log] QCA found no solutions. Assuming previous result is optimal.")
-            if iteration == 1: best_path_found = "No solution found below S"
-            break
-            
-        # 3.3) 그로버 탐색 실행
-        k = floor(pi / 4 * sqrt(N_total / M))
-        print(f"[Log] Running Grover's search with k = {k} iterations...")
-        
-        cr = ClassicalRegister(num_tour_qubits, name="c")
-        search_qc = QuantumCircuit(*all_grover_qregs, cr)
-        search_qc.append(state_prep_gate, tour_reg)
-        for _ in range(k):
-            search_qc.append(grover_op_gate, search_qc.qubits)
-        search_qc.measure(tour_reg, cr)
-        
-        t_qc = transpile(search_qc, backend); result = backend.run(t_qc, shots=4096).result(); counts = result.get_counts()
-        winner_binary = max(counts, key=counts.get)
-        
-        # 3.4) 임계값 갱신
-        new_path = binary_to_path(winner_binary, N); C_new = calculate_cost(D, new_path)
-        print(f"  -> Found new path: {new_path} with cost = {C_new}")
-
-        if C_new >= best_cost_found:
-            print(f"\n[Log] Found cost {C_new} is not better than best cost {best_cost_found}. Optimization finished.")
-            break
-
-        current_threshold_L = C_new; best_cost_found = C_new; best_path_found = new_path; iteration += 1
-
-    # --- 4. 최종 결과 출력 ---
-    print("\n" + "="*40); print("🏆 Optimization Complete! 🏆"); print("="*40)
-    classical_cost, classical_path = calculate_classical_tsp(D)
-    print(f"  - Classical Brute-force Path: {classical_path}"); print(f"  - Classical Brute-force Cost: {classical_cost}")
-    print(f"  - Quantum Solver Found Path: {best_path_found}"); print(f"  - Quantum Solver Found Cost: {best_cost_found}")
+    D = gen_symmetric_dist_4(seed=7)
+    lens = tour_lengths(D)
+    pretty_tours(D, lens)
+    out = run_qca(lens, p=3, m=3, seed=1234)
+    print("\n[QCA] shots=512")
+    print("[QCA] counts(top5):", sorted(out["counts"].items(), key=lambda kv: kv[1], reverse=True)[:5])
+    print("[QCA] argmax:", out["argmax"], "→ int", int(out["argmax"], 2))
+    print(f"[QCA] theta≈{out['theta']:.4f},  M_est≈{out['M_est']}  (N_eff=8)")
+    print(f"[info] total logical qubits used: {out['qasm_qubits']}")
